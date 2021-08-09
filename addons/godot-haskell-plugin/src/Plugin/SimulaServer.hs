@@ -12,6 +12,7 @@
 
 module Plugin.SimulaServer where
 
+import Text.Printf
 import Data.Char
 import Data.Time.Clock
 import Control.Concurrent
@@ -170,6 +171,7 @@ getKeyboardAction gss keyboardShortcut =
         leftClick (Just (gsvs, coords@(SurfaceLocalCoordinates (sx, sy)))) True = do
           updateCursorStateAbsolute gsvs sx sy
           sendWlrootsMotion gsvs
+          logStr $ "click at " ++ (printf "%f" sx) ++ " " ++ (printf "%f" sy)
           processClickEvent' gsvs (Button True 1) coords -- BUTTON_LEFT = 1
         leftClick (Just (gsvs, coords@(SurfaceLocalCoordinates (sx, sy)))) False = do
           processClickEvent' gsvs (Button False 1) coords -- BUTTON_LEFT = 1
