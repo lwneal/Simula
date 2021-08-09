@@ -39,7 +39,7 @@ data Payload = Payload
                , minutesTotalSession :: Double
                }
 
-mixPanelToken = "d893bae9548d8e678cef251fd81df486" :: String
+mixPanelToken = "00000" :: String
 
 generateSessionUUID :: IO (UUID)
 generateSessionUUID = do exists                 <- doesFileExist "./UUID"
@@ -179,6 +179,4 @@ forkSendPayload uuid (Payload { numWindowsOpen = tvarSurfaceTelemetryMap
 -- The first variable encodes the number of windows open (possibly useful data).
 startTelemetry :: TVar SurfaceTelemetryMap -> IO ()
 startTelemetry tvarSurfaceTelemetryMap = do uuid <- generateSessionUUID
-                                            forkIO $ ensureUUIDIsRegistered uuid
-                                            forkSendPayloadEveryMinuteInterval uuid tvarSurfaceTelemetryMap 5 -- Send payload every 5 minutes
                                             return ()
