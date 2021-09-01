@@ -39,6 +39,8 @@ let
 
     libleak = callPackage ./nix/libleak/libleak.nix {};
 
+    i3status = callPackage ./submodules/i3status/i3status.nix {};
+
     devBuildFalse = ''
       cp ./utils/GetNixGL.sh $out/bin/GetNixGL.sh
       ln -s ${godot}/bin/godot.x11.opt.debug.64 $out/bin/godot.x11.opt.debug.64
@@ -121,6 +123,34 @@ let
       echo "_RR_TRACE_DIR=./rr PATH=${xwayland-dev}/bin:${xkbcomp}/bin:\$PATH LD_LIBRARY_PATH=${SDL2}/lib:${vulkan-loader-custom}/lib \$(./utils/GetNixGL.sh) ${rr}/bin/rr -M replay \"\$@\"" >> $out/bin/rootston_rr_replay
       chmod +x $out/bin/rootston_rr_replay
 
+      # demo_local
+      echo "export LOCALE_ARCHIVE=${glibc-locales}/lib/locale/locale-archive" >> $out/bin/demo_local
+      echo "mkdir -p log" >> $out/bin/demo_local
+      echo "mkdir -p config" >> $out/bin/demo_local
+      echo "PATH=${xwayland-dev}/bin:${xkbcomp}/bin:\$PATH LD_LIBRARY_PATH=${SDL2}/lib:${vulkan-loader-custom}/lib:${openxr-loader}/lib:${libv4l}/lib \$(./utils/GetNixGL.sh) ./submodules/godot/bin/godot.x11.tools.64 -m --path ./submodules/Demo" >> $out/bin/demo_local
+      chmod +x $out/bin/demo_local
+
+      # demo_local_editor
+      echo "export LOCALE_ARCHIVE=${glibc-locales}/lib/locale/locale-archive" >> $out/bin/demo_local_editor
+      echo "mkdir -p log" >> $out/bin/demo_local_editor
+      echo "mkdir -p config" >> $out/bin/demo_local_editor
+      echo "PATH=${xwayland-dev}/bin:${xkbcomp}/bin:\$PATH LD_LIBRARY_PATH=${SDL2}/lib:${vulkan-loader-custom}/lib:${openxr-loader}/lib:${libv4l}/lib \$(./utils/GetNixGL.sh) ./submodules/godot/bin/godot.x11.tools.64 -e --path ./submodules/Demo" >> $out/bin/demo_local_editor
+      chmod +x $out/bin/demo_local_editor
+
+      # demo_rr_record
+      echo "_RR_TRACE_DIR=./rr PATH=${xwayland-dev}/bin:${xkbcomp}/bin:\$PATH LD_LIBRARY_PATH=${SDL2}/lib:${vulkan-loader-custom}/lib:${libv4l}/lib \$(./utils/GetNixGL.sh) ${rr}/bin/rr record -i SIGUSR1 ./submodules/godot/bin/godot.x11.tools.64 --args -m --path ./submodules/Demo" >> $out/bin/demo_rr_record
+      chmod +x $out/bin/demo_rr_record
+
+      # demo_rr_replay
+      echo "_RR_TRACE_DIR=./rr PATH=${xwayland-dev}/bin:${xkbcomp}/bin:\$PATH LD_LIBRARY_PATH=${SDL2}/lib:${vulkan-loader-custom}/lib:${libv4l}/lib \$(./utils/GetNixGL.sh) ${rr}/bin/rr -M replay \"\$@\"" >> $out/bin/demo_rr_replay
+      chmod +x $out/bin/demo_rr_replay
+
+      # demo_apitrace
+      echo "rm *.trace" >> $out/bin/demo_apitrace
+      echo "PATH=${xwayland-dev}/bin:${xkbcomp}/bin:\$PATH LD_LIBRARY_PATH=${SDL2}/lib:${vulkan-loader-custom}/lib \$(./utils/GetNixGL.sh) apitrace trace --api gl ./submodules/bin/godot.x11.tools.64 --path ./submodules/Demo" >> $out/bin/demo_apitrace
+      echo "apitrace dump *.trace | grep glTex > glTex.trace" >> $out/bin/demo_apitrace
+      chmod +x $out/bin/demo_apitrace
+
       ln -s ${valgrind}/bin/valgrind $out/bin/valgrind
       ln -s ${valkyrie}/bin/valkyrie $out/bin/valkyrie
 
@@ -160,6 +190,12 @@ let
       exec ${midori}/bin/midori
       '';
 
+    i3status-wrapped = writeScriptBin "i3status" ''
+      #!${stdenv.shell}
+      export LC_ALL=C
+      exec ${i3status}/bin/i3status "$@"
+      '';
+
     simulaPackages = if devBuild == true then [ valgrind libleak ] else [ godot godot-haskell-plugin ];
     linkGHP = if devBuild == true then "" else ''
       ln -s ${godot-haskell-plugin}/lib/ghc-${ghc-version}/libgodot-haskell-plugin.so $out/bin/libgodot-haskell-plugin.so;
@@ -195,6 +231,7 @@ let
       $PWD/result/srcs/wayland/egl \
       $PWD/result/srcs/libxcb/src \
       $PWD/result/srcs/xwayland/doc \
+      $PWD/submodules/Demo \
       ${wayland-dev} \
       ${wlroots-dev} \
       > pernosco.txt 2>&1
@@ -216,7 +253,7 @@ let
         # && (baseNameOf path != "result")                        # "
       ) ./.;
 
-      buildInputs = [ xpra xrdb wmctrl fontconfig glibc-locales xfce4-terminal-wrapped openxr-loader midori-wrapped pernoscoSubmit ] ++ simulaPackages;
+      buildInputs = [ xpra xrdb wmctrl fontconfig glibc-locales xfce4-terminal-wrapped openxr-loader midori-wrapped pernoscoSubmit i3status-wrapped ] ++ simulaPackages;
       installPhase = ''
       mkdir -p $out/bin
       mkdir -p $out/srcs
@@ -225,6 +262,7 @@ let
       ln -s ${xrdb}/bin/xrdb $out/bin/xrdb
       ln -s ${wmctrl}/bin/wmctrl $out/bin/wmctrl
       ln -s ${ffmpeg-full}/bin/ffplay $out/bin/ffplay
+      ln -s ${ffmpeg-full}/bin/ffmpeg $out/bin/ffmpeg
       ln -s ${midori-wrapped}/bin/midori $out/bin/midori
       ln -s ${synapse}/bin/synapse $out/bin/synapse
       ln -s ${xsel}/bin/xsel $out/bin/xsel
@@ -234,6 +272,7 @@ let
       ln -s ${rr}/bin/rr $out/bin/rr
       ln -s ${dialog}/bin/dialog $out/bin/dialog
       ln -s ${curl}/bin/curl $out/bin/curl
+      ln -s ${i3status-wrapped}/bin/i3status $out/bin/i3status
 
       '' + linkGHP + devBuildScript;
     };

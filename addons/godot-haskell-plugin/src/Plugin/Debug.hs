@@ -278,16 +278,6 @@ logMemRecursively = do
   Control.Concurrent.threadDelay (1 * 1000000)
   logMemRecursively
 
-logMemPid :: GodotSimulaServer -> IO Float
-logMemPid gss = do
-  let pid = (gss ^. gssPid)
-  (_, out', _) <- B.readCreateProcessWithExitCode (shell $ "ps -p " ++ pid ++ " -o rss=") ""
-  let pidMem = read $ (B.unpack out') :: Float
-  -- logStr $ "PID mem: " ++ (show pidMem)
-  -- Control.Concurrent.threadDelay (1 * 1000000)
-  -- logMemPid gss
-  return (pidMem / 1000) -- return ~MB
-
 debugLogDepthFirstSurfaces :: GodotSimulaViewSprite -> IO ()
 debugLogDepthFirstSurfaces gsvs = do
   cs <- readTVarIO (gsvs ^. gsvsCanvasSurface)
@@ -326,7 +316,8 @@ debugLogDepthFirstSurfaces gsvs = do
 
           -- Get file path
           frame <- readTVarIO (gsvs ^. gsvsFrameCount)
-          let pathStr = "./png/" ++ (show (coerce wlrSurface :: Ptr GodotWlrSurface)) ++ "." ++ (show frame) ++ ".png"
+          createDirectoryIfMissing False "media"
+          let pathStr = "./media/" ++ (show (coerce wlrSurface :: Ptr GodotWlrSurface)) ++ "." ++ (show frame) ++ ".png"
           canonicalPath <- canonicalizePath pathStr
           pathStr' <- toLowLevel (pack pathStr)
 

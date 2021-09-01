@@ -90,7 +90,7 @@ import Control.Exception
 import qualified Data.Vector as V
 
 getKeyboardAction :: GodotSimulaServer -> KeyboardShortcut -> KeyboardAction
-getKeyboardAction gss keyboardShortcut = 
+getKeyboardAction gss keyboardShortcut =
   case (keyboardShortcut ^. keyAction) of
     "moveCursor" -> moveCursor
     "clickLeft" -> leftClick
@@ -147,12 +147,15 @@ getKeyboardAction gss keyboardShortcut =
     "sendToWorkspace7" -> sendToWorkspace gss 7
     "sendToWorkspace8" -> sendToWorkspace gss 8
     "sendToWorkspace9" -> sendToWorkspace gss 9
+    "sendToWorkspacePersistent" -> sendToWorkspace gss 0
     "rotateWorkspaceHorizontallyLeft" -> rotateWorkspaceHorizontally gss (0.15707963)
     "rotateWorkspaceHorizontallyRight" -> rotateWorkspaceHorizontally gss (-0.15707963)
     "rotateWorkspacesHorizontallyLeft" -> rotateWorkspacesHorizontally gss (0.15707963)
     "rotateWorkspacesHorizontallyRight" -> rotateWorkspacesHorizontally gss (-0.15707963)
     "toggleARMode" -> toggleARMode gss
     "toggleWasdMode" -> toggleWasdMode gss
+    "addLeapMotion" -> addLeapMotion gss
+    "recordScreen" -> recordScreen gss
     _ -> shellLaunch gss (keyboardShortcut ^. keyAction)
 
   where moveCursor :: SpriteLocation -> Bool -> IO ()
@@ -225,6 +228,32 @@ getKeyboardAction gss keyboardShortcut =
           Plugin.Types.rotateWorkspaceHorizontally gss radians Workspaces
           return ()
         rotateWorkspacesHorizontally gss radians _ False = do
+          return ()
+
+        recordScreen :: GodotSimulaServer -> SpriteLocation -> Bool -> IO ()
+        recordScreen gss _ True = do
+          maybePh <- readTVarIO (gss ^. gssScreenRecorder)
+          case maybePh of
+            Nothing -> do
+              getSingleton Godot_OS "OS" >>= \os -> G.set_window_fullscreen os True
+              putStrLn "Starting screen recording.."
+              forkIO $ do timeStampStr <- show <$> getCurrentTime
+                          let videoBaseName' = "simula_screen_recording_" <> timeStampStr
+                          let videoBaseName = filter (\x -> x /= ' ') videoBaseName'
+                          createDirectoryIfMissing False "media"
+                          let relativePath = ("./media/" <> videoBaseName <> ".mkv")
+                          (_,_,_, ph) <- createProcess (proc "./result/bin/ffmpeg" ["-nostdin", "-f", "x11grab", "-framerate", "90", "-i", ":0.0", "-c:v", "libx264", "-y", "-loglevel", "quiet", relativePath])
+                          atomically $ writeTVar (gss ^. gssScreenRecorder) (Just ph)
+              return ()
+            Just ph -> do
+              putStrLn "Stopping screen recording.."
+              getSingleton Godot_OS "OS" >>= \os -> do
+                G.set_window_maximized os True -- Fails?
+                G.set_window_fullscreen os False
+              terminateProcess ph
+              atomically $ writeTVar (gss ^. gssScreenRecorder) (Nothing)
+          return ()
+        recordScreen gss _ False = do
           return ()
 
         terminateWindow :: SpriteLocation -> Bool -> IO ()
@@ -433,14 +462,44 @@ getKeyboardAction gss keyboardShortcut =
         toggleARMode :: GodotSimulaServer -> SpriteLocation -> Bool -> IO ()
         toggleARMode gss _ True = do
           putStrLn "Toggling AR mode.."
-          (worldEnvironment, _) <- readTVarIO (gss ^. gssWorldEnvironment)
-          environment <- G.get_environment worldEnvironment
-          G.set_background environment G.BG_CAMERA_FEED
-          G.set_camera_feed_id environment 1
+
+          -- CanvasLayer
+          canvasLayer <- unsafeInstance GodotCanvasLayer "CanvasLayer"
+          G.set_layer canvasLayer (-1)
+
+          -- GodotShaderMaterial
+          -- canvasShaderMaterial' <- load GodotShaderMaterial "ShaderMaterial" "res://addons/godot-haskell-plugin/CanvasARShader.tres"
+          -- let canvasShaderMaterial = Data.Maybe.fromJust canvasShaderMaterial'
+
+          -- CameraTexture
           cameraServer <- getSingleton GodotCameraServer "CameraServer"
           numCameras <- G.get_feed_count cameraServer
-          putStrLn $ "CameraServer get_feed_count: " ++ (show numCameras)
           when (numCameras > 0) $ G.get_feed cameraServer 0 >>= \cam -> G.set_active cam True
+          cameraTexture <- unsafeInstance GodotCameraTexture "CameraTexture"
+          G.set_camera_feed_id cameraTexture 1
+
+          -- CanvasAR
+          car <- "res://addons/godot-haskell-plugin/CanvasAR.gdns"
+            & newNS' []
+            >>= Api.godot_nativescript_get_userdata
+            >>= deRefStablePtr . castPtrToStablePtr :: IO CanvasAR
+          do atomically $ do writeTVar (car ^. carGSS) gss -- Possible race condition
+                             writeTVar (car ^. carCanvasLayer) canvasLayer
+                             -- writeTVar (car ^. carShader) canvasShaderMaterial
+                             writeTVar (car ^. carCameraTexture) cameraTexture
+                             writeTVar (gss ^. gssCanvasAR) car
+          -- G.set_material car (safeCast canvasShaderMaterial)
+
+          -- environment
+          (worldEnvironment, _) <- readTVarIO (gss ^. gssWorldEnvironment)
+          environment <- G.get_environment worldEnvironment
+          G.set_background environment G.BG_CANVAS
+          G.set_canvas_max_layer environment (-1)
+
+          -- Scene adjustment
+          addChild worldEnvironment canvasLayer
+          addChild canvasLayer car
+
           return ()
         toggleARMode _ _ _ = do
           return ()
@@ -462,27 +521,40 @@ getKeyboardAction gss keyboardShortcut =
         switchToWorkspace :: GodotSimulaServer -> Int -> SpriteLocation -> Bool -> IO ()
         switchToWorkspace gss workspaceNum _ True = do
           putStrLn $ "Switching to workspace" ++ (show workspaceNum)
-          currentWorkspace <- readTVarIO (gss ^. gssWorkspace)
+          (currentWorkspace, currentWorkspaceStr) <- readTVarIO (gss ^. gssWorkspace)
           let newWorkspace = (gss ^. gssWorkspaces) V.! workspaceNum
 
           -- Set new workspace for new gsvs to inherit from
-          atomically $ writeTVar (gss ^. gssWorkspace) newWorkspace
+          atomically $ writeTVar (gss ^. gssWorkspace) (newWorkspace, (show workspaceNum))
 
           -- Swap workspace in scene graph
           removeChild gss currentWorkspace
           addChild gss newWorkspace
-          (canvasLayer, rtLabel) <- readTVarIO (gss ^. gssHUD)
-          G.set_text rtLabel =<< (toLowLevel (pack (show workspaceNum)))
+          updateWorkspaceHUD gss
         switchToWorkspace _ _ _ _ = return ()
 
         sendToWorkspace :: GodotSimulaServer -> Int -> SpriteLocation -> Bool -> IO ()
         sendToWorkspace gss workspaceNum (Just (gsvs, coords@(SurfaceLocalCoordinates (sx, sy)))) True = do
-          putStrLn $ "Sending app to workspace" ++ (show workspaceNum)
-          currentWorkspace <- readTVarIO (gss ^. gssWorkspace)
-          let newWorkspace = (gss ^. gssWorkspaces) V.! workspaceNum
-          removeChild currentWorkspace gsvs
-          addChild newWorkspace gsvs
+          putStrLn $ "Sending app to workspace " ++ (show workspaceNum)
+          (currentWorkspace, currentWorkspaceStr) <- readTVarIO (gss ^. gssWorkspace)
+          workspacePersistent <- readTVarIO (gss ^. gssWorkspacePersistent)
+
+          isChildOfWorkspacePersistent <- G.is_a_parent_of ((safeCast workspacePersistent) :: GodotNode ) ((safeCast gsvs) :: GodotNode)
+          case isChildOfWorkspacePersistent of
+            True -> removeChild workspacePersistent gsvs
+            False -> removeChild currentWorkspace gsvs
+
+          case workspaceNum of
+            0 -> do addChild workspacePersistent gsvs
+            _ -> do let newWorkspace = (gss ^. gssWorkspaces) V.! workspaceNum
+                    addChild newWorkspace gsvs
         sendToWorkspace _ _ _ _ = return ()
+
+        addLeapMotion :: GodotSimulaServer -> SpriteLocation -> Bool -> IO ()
+        addLeapMotion gss _ True = do
+          putStrLn "Adding LEAP Motion to scene graph.."
+          addLeapMotionScene gss
+        addLeapMotion _ _ _ = return ()
 
 isMask :: Int -> Bool
 isMask keyOrMask = elem keyOrMask [ G.KEY_MASK_SHIFT
@@ -564,6 +636,19 @@ process gss [deltaGV] = do
   delta <- fromGodotVariant deltaGV :: IO Float
   processWASDMovement gss delta
 
+  -- Update i3status HUD
+  hud <- readTVarIO (gss ^. gssHUD)
+  let canvasLayer = (hud ^. hudCanvasLayer)
+  let rtLabel = (hud ^. hudRtlI3)
+  let dynamicFont = (hud ^. hudDynamicFont)
+  let i3status = (hud ^. hudI3Status)
+  G.clear rtLabel
+  G.push_font rtLabel (safeCast dynamicFont)
+  G.push_align rtLabel 2
+  G.append_bbcode rtLabel `withGodotString` (pack i3status)
+  G.pop rtLabel
+  G.pop rtLabel
+
 ready :: GodotSimulaServer -> [GodotVariant] -> IO ()
 ready gss _ = do
   debugModeMaybe <- lookupEnv "DEBUG"
@@ -637,8 +722,10 @@ ready gss _ = do
   (worldEnvironment, _) <- readTVarIO (gss ^. gssWorldEnvironment)
   addChild gss worldEnvironment
 
-  defaultWorkspace <- readTVarIO (gss ^. gssWorkspace)
+  (defaultWorkspace, workspaceStr) <- readTVarIO (gss ^. gssWorkspace)
   addChild gss defaultWorkspace
+  workspacePersistent <- readTVarIO (gss ^. gssWorkspacePersistent)
+  addChild gss workspacePersistent
 
   -- Launch default apps
   sApps <- readTVarIO (gss ^. gssStartingApps)
@@ -649,9 +736,14 @@ ready gss _ = do
     Nothing -> return ()
     Just debugModeVal  -> (forkIO $ debugFunc gss) >> return ()
 
-  (canvasLayer , rtLabel) <- readTVarIO (gss ^. gssHUD)
+  hud <- readTVarIO (gss ^. gssHUD)
+  let canvasLayer = (hud ^. hudCanvasLayer)
+  let rtLabelW = (hud ^. hudRtlWorkspace)
+  let rtLabel = (hud ^. hudRtlI3)
   addChild gss canvasLayer
+  addChild canvasLayer rtLabelW
   addChild canvasLayer rtLabel
+  forkUpdateHUDRecursively gss
   return ()
 
   -- Crashes here, but should be done when camera is ready:
@@ -755,7 +847,7 @@ addWlrChildren gss = do
 parseConfiguration :: IO (Configuration)
 parseConfiguration = do
   profile <- lookupEnv "PROFILE"
-  let defaultConfiguration = Configuration {_backend = "OpenVR", _startingApps = StartingApps {_center = Just "ENV=val ./result/bin/xfce4-terminal", _right = Nothing, _bottom = Nothing, _left = Nothing, _top = Nothing}, _defaultWindowResolution = Just (900,900), _defaultWindowScale = 1.0, _axisScrollSpeed = 0.03, _mouseSensitivityScaler = 1.00, _keyBindings = [KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_BACKSPACE"], _keyAction = "terminateWindow"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_ESCAPE"], _keyAction = "toggleGrabMode"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_SLASH"], _keyAction = "launchTerminal"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_APOSTROPHE"], _keyAction = "moveCursor"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_ENTER"], _keyAction = "clickLeft"}, KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_Q"], _keyAction = "clickRight"}, KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_ALT_R"], _keyAction = "grabWindow"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_ALT_L"], _keyAction = "grabWindow"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_A"], _keyAction = "launchAppLauncher"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_E"], _keyAction = "cycleEnvironment"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_F"], _keyAction = "orientWindowTowardsGaze"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_9"], _keyAction = "scaleWindowDown"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_0"], _keyAction = "scaleWindowUp"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_MINUS"], _keyAction = "zoomOut"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_EQUAL"], _keyAction = "zoomIn"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_LEFT"], _keyAction = "contractWindowHorizontally"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_RIGHT"], _keyAction = "extendWindowHorizontally"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_UP"], _keyAction = "contractWindowVertically"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_DOWN"], _keyAction = "extendWindowVertically"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_S"], _keyAction = "resizeWindowToDefaultSize"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_COMMA"], _keyAction = "pullWindow"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_PERIOD"], _keyAction = "pushWindow"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_W"], _keyAction = "launchHMDWebCam"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_R"], _keyAction = "emacsclient -c"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_MASK_SHIFT","KEY_ESCAPE"], _keyAction = "terminateSimula"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_MASK_ALT","KEY_UP"], _keyAction = "increaseTransparency"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_MASK_ALT","KEY_DOWN"], _keyAction = "decreaseTransparency"},KeyboardShortcut {_keyCombination = ["KEY_PRINT"], _keyAction = "toggleScreenshotMode"},KeyboardShortcut {_keyCombination = ["KEY_MASK_SHIFT","KEY_PRINT"], _keyAction = "takeScreenshotGlobal"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_K"], _keyAction = "firefox -new-window"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_G"], _keyAction = "google-chrome-stable --new-window news.ycombinator.com"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_J"], _keyAction = "gvim"}], _keyRemappings = [], _environmentsDirectory = "./environments", _environmentDefault = "./environments/AllSkyFree_Sky_EpicBlueSunset_Equirect.png", _scenes = []} --
+  let defaultConfiguration = Configuration {_backend = "OpenVR", _startingApps = StartingApps {_center = Just "ENV=val ./result/bin/xfce4-terminal", _right = Nothing, _bottom = Nothing, _left = Nothing, _top = Nothing}, _defaultWindowResolution = Just (900,900), _defaultWindowScale = 1.0, _axisScrollSpeed = 0.03, _mouseSensitivityScaler = 1.00, _keyBindings = [KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_BACKSPACE"], _keyAction = "terminateWindow"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_ESCAPE"], _keyAction = "toggleGrabMode"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_SLASH"], _keyAction = "launchTerminal"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_APOSTROPHE"], _keyAction = "moveCursor"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_ENTER"], _keyAction = "clickLeft"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_ALT_R"], _keyAction = "grabWindow"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_ALT_L"], _keyAction = "grabWindow"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_A"], _keyAction = "launchAppLauncher"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_E"], _keyAction = "cycleEnvironment"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_F"], _keyAction = "orientWindowTowardsGaze"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_9"], _keyAction = "scaleWindowDown"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_0"], _keyAction = "scaleWindowUp"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_MINUS"], _keyAction = "zoomOut"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_EQUAL"], _keyAction = "zoomIn"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_LEFT"], _keyAction = "contractWindowHorizontally"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_RIGHT"], _keyAction = "extendWindowHorizontally"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_UP"], _keyAction = "contractWindowVertically"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_DOWN"], _keyAction = "extendWindowVertically"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_S"], _keyAction = "resizeWindowToDefaultSize"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_COMMA"], _keyAction = "pullWindow"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_PERIOD"], _keyAction = "pushWindow"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_W"], _keyAction = "launchHMDWebCam"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_R"], _keyAction = "emacsclient -c"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_MASK_SHIFT","KEY_ESCAPE"], _keyAction = "terminateSimula"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_MASK_ALT","KEY_UP"], _keyAction = "increaseTransparency"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_MASK_ALT","KEY_DOWN"], _keyAction = "decreaseTransparency"},KeyboardShortcut {_keyCombination = ["KEY_PRINT"], _keyAction = "toggleScreenshotMode"},KeyboardShortcut {_keyCombination = ["KEY_MASK_SHIFT","KEY_PRINT"], _keyAction = "takeScreenshotGlobal"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_K"], _keyAction = "firefox -new-window"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_G"], _keyAction = "google-chrome-stable --new-window news.ycombinator.com"},KeyboardShortcut {_keyCombination = ["KEY_MASK_META","KEY_J"], _keyAction = "gvim"}], _keyRemappings = [], _environmentsDirectory = "./environments", _environmentDefault = "./environments/AllSkyFree_Sky_EpicBlueSunset_Equirect.png", _scenes = [], _hudConfig = "./config/i3status.config"} --
   config <- case profile of
     Just value -> return defaultConfiguration
     Nothing -> input auto "./config/config.dhall" :: IO Configuration
@@ -849,33 +941,46 @@ initGodotSimulaServer obj = do
       gssGrab' <- newTVarIO Nothing
 
       gssWorkspaces' <- V.replicateM 10 (unsafeInstance GodotSpatial "Spatial")
-      gssWorkspace' <- newTVarIO $ (gssWorkspaces' V.! 1)
+      gssWorkspace' <- newTVarIO $ ((gssWorkspaces' V.! 1), "1")
+      workspacePersistent <- (unsafeInstance GodotSpatial "Spatial")
+      gssWorkspacePersistent' <- newTVarIO $ workspacePersistent
       gssDiffMap' <- newTVarIO $ M.empty -- Can't instantiate this until we have the gss Spatial information
 
       canvasLayer <- unsafeInstance GodotCanvasLayer "CanvasLayer"
-      -- offset <- toLowLevel (V2 10 10) :: IO GodotVector2 -- Doesn't seem to work
-      -- G.set_offset canvasLayer offset
-      -- G.set_custom_viewport viewportNode -- To be used for affecting the VR viewport
-      scale <- toLowLevel (V2 2 2) :: IO GodotVector2
-      G.set_scale canvasLayer scale
 
+      -- See https://docs.godotengine.org/en/stable/tutorials/gui/size_and_anchors.html
       rtLabel <- unsafeInstance GodotRichTextLabel "RichTextLabel"
-      G.set_margin rtLabel 2 800
-      G.set_margin rtLabel 3 400
-      G.add_text rtLabel =<< toLowLevel "1"
+      G.set_anchor_and_margin rtLabel 0 0 0 False -- MARGIN_LEFT
+      G.set_anchor_and_margin rtLabel 1 0 0 False -- MARGIN_TOP
+      G.set_anchor_and_margin rtLabel 2 1 0 False -- MARGIN_RIGHT
+      G.set_anchor_and_margin rtLabel 3 0 50 False -- MARGIN_BOTTOM
 
-      -- Code pattern for adding an image to the HUD
-      -- maybeBattText <- getTextureFromURL "batt.png"
-      -- contentHeight <- G.get_content_height rtLabel
-      -- case maybeBattText of
-      --   Just battText -> G.add_image rtLabel battText 0 contentHeight -- 20 is a test
-      --   Nothing -> putStrLn "Can't add HUD texture!"
+      rtLabelW <- unsafeInstance GodotRichTextLabel "RichTextLabel"
+      G.set_anchor_and_margin rtLabelW 0 0 0 False -- MARGIN_LEFT
+      G.set_anchor_and_margin rtLabelW 1 0 0 False -- MARGIN_TOP
+      G.set_anchor_and_margin rtLabelW 2 1 0 False -- MARGIN_RIGHT
+      G.set_anchor_and_margin rtLabelW 3 0 50 False -- MARGIN_BOTTOM
+      G.set_use_bbcode rtLabel True
+      G.set_use_bbcode rtLabelW True
 
-      -- G.set_valign label G.VALIGN_CENTER -- VALIGN_TOP, VALIGN_CENTER, VALIGN_BOTTOM, VALI layer value
-      -- G.set_visible_characters label <int> -- -1 to  layer value
-      -- G.set_align layer value
+      maybeSvr <- getTextureFromURL "SVR.png"
+      let svr = Data.Maybe.fromJust maybeSvr
 
-      gssHUD' <- newTVarIO (canvasLayer, rtLabel) :: IO (TVar HUD)
+      dynamicFont <- unsafeInstance GodotDynamicFont "DynamicFont"
+      dynamicFontData' <- load GodotDynamicFontData "DynamicFontData" "res://OpenSansEmoji.ttf"
+      let dynamicFontData = Data.Maybe.fromJust dynamicFontData'
+      G.set_font_data dynamicFont dynamicFontData
+      G.set_size dynamicFont 24
+
+      let hud = HUD {
+          _hudCanvasLayer = canvasLayer :: GodotCanvasLayer
+        , _hudRtlWorkspace = rtLabelW   :: GodotRichTextLabel
+        , _hudRtlI3 = rtLabel           :: GodotRichTextLabel
+        , _hudSvrTexture = svr          :: GodotTexture
+        , _hudDynamicFont = dynamicFont :: GodotDynamicFont
+        , _hudI3Status = ""             :: String
+      }
+      gssHUD' <- newTVarIO hud
 
       gssScenes' <- newTVarIO (configuration ^. scenes)
 
@@ -883,6 +988,8 @@ initGodotSimulaServer obj = do
 
       gssWasdInitialRotation' <- newTVarIO 0
       gssWasdMode' <- newTVarIO False
+      gssCanvasAR' <- newTVarIO (error "Failed to initialize GodotSimulaServer") :: IO (TVar CanvasAR)
+      gssScreenRecorder' <- newTVarIO (Nothing)
 
       let gss = GodotSimulaServer {
         _gssObj                   = obj                       :: GodotObject
@@ -920,12 +1027,15 @@ initGodotSimulaServer obj = do
       , _gssGrab                  = gssGrab'                  :: TVar (Maybe Grab)
       , _gssDiffMap               = gssDiffMap'               :: TVar (M.Map GodotSpatial GodotTransform)
       , _gssWorkspaces            = gssWorkspaces'            :: Vector GodotSpatial
-      , _gssWorkspace             = gssWorkspace'             :: TVar GodotSpatial
+      , _gssWorkspace             = gssWorkspace'             :: TVar (GodotSpatial, String)
+      , _gssWorkspacePersistent   = gssWorkspacePersistent'   :: TVar GodotSpatial
       , _gssHUD                   = gssHUD'                   :: TVar HUD
       , _gssScenes                = gssScenes'                :: TVar [String]
       , _gssScene                 = gssScene'                 :: TVar (Maybe (String, GodotNode))
       , _gssWasdInitialRotation   = gssWasdInitialRotation'   :: TVar Float
       , _gssWasdMode              = gssWasdMode'              :: TVar Bool
+      , _gssCanvasAR              = gssCanvasAR'              :: TVar CanvasAR
+      , _gssScreenRecorder        = gssScreenRecorder'        :: TVar (Maybe ProcessHandle)
       }
   return gss
   where getStartingAppsStr :: Maybe String -> String
@@ -1138,16 +1248,21 @@ physicsProcess gss _ = do
   gsvsActiveCursor <- readTVarIO (gss ^. gssActiveCursorGSVS)
   maybeGssGrab <- readTVarIO (gss ^. gssGrab)
   case maybeGssGrab of
-    (Just (GrabWindows prevPovTransform)) -> do currentWorkspace <- readTVarIO (gss ^. gssWorkspace)
+    (Just (GrabWindows prevPovTransform)) -> do (currentWorkspace, currentWorkspaceStr) <- readTVarIO (gss ^. gssWorkspace)
                                                 diffMap <- readTVarIO (gss ^. gssDiffMap)
                                                 diff <- getGrabDiff gss
                                                 id <- makeIdentityTransform
                                                 let diffPrev = M.findWithDefault id currentWorkspace diffMap
                                                 diffComposed <- Api.godot_transform_operator_multiply diff diffPrev
                                                 G.set_transform currentWorkspace diffComposed
+
+                                                workspacePersistent <- readTVarIO (gss ^. gssWorkspacePersistent)
+                                                let diffPrevPersistent = M.findWithDefault id workspacePersistent diffMap
+                                                diffComposedPersistent <- Api.godot_transform_operator_multiply diff diffPrevPersistent
+                                                G.set_transform workspacePersistent diffComposedPersistent
     (Just (GrabWindow gsvs dist)) -> do setInFrontOfUser gsvs dist
                                         orientSpriteTowardsGaze gsvs
-    (Just (GrabWorkspaces prevPovTransform)) -> do currentWorkspace <- readTVarIO (gss ^. gssWorkspace)
+    (Just (GrabWorkspaces prevPovTransform)) -> do (currentWorkspace, currentWorkspaceStr) <- readTVarIO (gss ^. gssWorkspace)
                                                    diffMap <- readTVarIO (gss ^. gssDiffMap)
                                                    diff <- getGrabDiff gss
                                                    id <- makeIdentityTransform

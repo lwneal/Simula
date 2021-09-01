@@ -56,6 +56,7 @@ let Configuration =
                               , { _keyCombination = ["KEY_MASK_META", "KEY_MASK_ALT", "KEY_DOWN"]      , _keyAction = "decreaseTransparency"       }
                               , { _keyCombination = ["KEY_PRINT"]                                      , _keyAction = "toggleScreenshotMode"       }
                               , { _keyCombination = ["KEY_MASK_SHIFT", "KEY_PRINT"]                    , _keyAction = "takeScreenshotGlobal"       }
+                              , { _keyCombination = ["KEY_MASK_META", "KEY_MASK_SHIFT", "KEY_PRINT"]   , _keyAction = "recordScreen"       }
                               , { _keyCombination = ["KEY_MASK_META", "KEY_1"]                         , _keyAction = "workspace1"       }
                               , { _keyCombination = ["KEY_MASK_META", "KEY_2"]                         , _keyAction = "workspace2"       }
                               , { _keyCombination = ["KEY_MASK_META", "KEY_3"]                         , _keyAction = "workspace3"       }
@@ -72,6 +73,7 @@ let Configuration =
                               , { _keyCombination = ["KEY_MASK_META", "KEY_MASK_SHIFT", "KEY_6"]       , _keyAction = "sendToWorkspace6" }
                               , { _keyCombination = ["KEY_MASK_META", "KEY_MASK_SHIFT", "KEY_7"]       , _keyAction = "sendToWorkspace7" }
                               , { _keyCombination = ["KEY_MASK_META", "KEY_MASK_SHIFT", "KEY_8"]       , _keyAction = "sendToWorkspace8" }
+                              , { _keyCombination = ["KEY_MASK_META", "KEY_MASK_SHIFT", "KEY_0"]       , _keyAction = "sendToWorkspacePersistent" }
 
 
                                 -- Anything else is parsed as a shell command:
@@ -90,6 +92,10 @@ let Configuration =
   , _environmentsDirectory = "./environments"
   , _environmentDefault    = "./environments/AllSkyFree_Sky_EpicBlueSunset_Equirect.png"
   , _scenes = [] : List Text
+  -- Configuration of Simula's HUD (in i3status format).
+  -- See https://i3wm.org/docs/i3status.html
+  , _hudConfig = "./config/i3status.config"
+
   }
 
 in Configuration

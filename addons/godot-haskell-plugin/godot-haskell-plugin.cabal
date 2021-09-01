@@ -72,6 +72,7 @@ library
     , hspec-core
     , QuickCheck
     , safe-exceptions
+    , io-streams
   exposed-modules:
       Telemetry
       Plugin
@@ -90,6 +91,7 @@ library
       Plugin.Simula
       Plugin.VR
       Plugin.Debug
+      Plugin.CanvasAR
       -- Debug.C
       -- Debug.Marshal
   default-language: Haskell2010
@@ -135,6 +137,7 @@ foreign-library godot-haskell-plugin
     Plugin.Simula
     Plugin.VR
     Plugin.Debug
+    Plugin.CanvasAR
     -- Debug.C
     -- Debug.Marshal
   other-modules: FLib
@@ -172,6 +175,7 @@ foreign-library godot-haskell-plugin
     , hspec-core
     , QuickCheck
     , safe-exceptions
+    , io-streams
 
   default-extensions:
        FlexibleContexts

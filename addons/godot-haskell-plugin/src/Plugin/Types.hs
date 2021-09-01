@@ -29,6 +29,9 @@ import           Data.Typeable
 import           Godot.Gdnative.Types
 import           Godot.Nativescript
 
+import           Data.Colour
+import           Data.Colour.SRGB.Linear
+
 import           Plugin.Imports
 
 import           Godot.Core.GodotVisualServer          as G
@@ -52,7 +55,10 @@ import           System.IO.Unsafe
 import           Data.Monoid
 import           Data.List
 -- import           Data.Text as T
+import           Data.Text.Encoding
 import           Data.Text
+import qualified System.Process.ByteString as B
+import qualified Data.ByteString.Char8 as B
 
 import Data.IORef
 
@@ -69,6 +75,10 @@ import Godot.Core.GodotViewport as G
 import Data.Map.Ordered as MO
 import Dhall
 import qualified Data.Vector as V
+import System.IO.Streams.Process
+import System.IO.Streams.Internal
+import qualified Data.ByteString as B
+import System.IO.Streams.Text
 
 instance Show Transform where
   show tf = (show (_tfBasis tf)) ++ (" w/position: ") ++ (show (_tfPosition tf))
@@ -141,6 +151,7 @@ data Configuration = Configuration {
 , _environmentDefault :: String
 -- , _defaultTransparency :: Double -- Remove until order independent transparency is implemented
 , _scenes :: [String]
+, _hudConfig :: String
 } deriving (Generic, Show)
 
 instance FromDhall KeyboardRemapping
@@ -164,7 +175,14 @@ data SimulaEnvironment = Day | Night
 data Grab = GrabWindow GodotSimulaViewSprite Float | GrabWindows GodotTransform | GrabWorkspaces GodotTransform
 type DiffMap = M.Map GodotSpatial GodotTransform
 
-type HUD = (GodotCanvasLayer, GodotRichTextLabel)
+data HUD = HUD
+  { _hudCanvasLayer :: GodotCanvasLayer
+  , _hudRtlWorkspace :: GodotRichTextLabel
+  , _hudRtlI3        :: GodotRichTextLabel
+  , _hudSvrTexture   :: GodotTexture
+  , _hudDynamicFont  :: GodotDynamicFont
+  , _hudI3Status     :: String
+  }
 
 -- We use TVar excessively since these datatypes must be retrieved from the
 -- scene graph (requiring IO)
@@ -204,17 +222,20 @@ data GodotSimulaServer = GodotSimulaServer
   , _gssGrab                  :: TVar (Maybe Grab)
   , _gssDiffMap               :: TVar (M.Map GodotSpatial GodotTransform)
   , _gssWorkspaces            :: Vector GodotSpatial
-  , _gssWorkspace             :: TVar GodotSpatial
+  , _gssWorkspace             :: TVar (GodotSpatial, String)
+  , _gssWorkspacePersistent   :: TVar GodotSpatial
   , _gssHUD                   :: TVar HUD
   , _gssScenes                :: TVar [String]
   , _gssScene                 :: TVar (Maybe (String, GodotNode))
   , _gssWasdInitialRotation   :: TVar Float
   , _gssWasdMode              :: TVar Bool
+  , _gssCanvasAR              :: TVar CanvasAR
+  , _gssScreenRecorder        :: TVar (Maybe ProcessHandle)
   }
 
 instance HasBaseClass GodotSimulaServer where
   type BaseClass GodotSimulaServer = GodotSpatial
-  super (GodotSimulaServer obj _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)  = GodotSpatial obj
+  super (GodotSimulaServer obj _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)  = GodotSpatial obj
 
 type SurfaceMap = OMap GodotWlrSurface CanvasSurface
 
@@ -273,6 +294,19 @@ instance HasBaseClass CanvasSurface where
 instance Eq CanvasSurface where
   (==) = (==) `on` _csObject
 
+data CanvasAR = CanvasAR {
+    _carObject :: GodotObject
+  , _carGSS :: TVar GodotSimulaServer
+  -- , _carViewport :: TVar GodotViewport
+  , _carCanvasLayer :: TVar GodotCanvasLayer
+  , _carShader :: TVar GodotShaderMaterial
+  , _carCameraTexture :: TVar GodotCameraTexture
+}
+
+instance HasBaseClass CanvasAR where
+  type BaseClass CanvasAR = GodotNode2D
+  super (CanvasAR obj _ _ _ _) = GodotNode2D obj
+
 data SimulaView = SimulaView
   { _svServer                  :: GodotSimulaServer -- Can obtain WlrSeat
   -- , _svWlrSurface              :: GodotWlrSurface -- Can obtain GodotWlrSurface from GodotWlrXdgSurface
@@ -301,6 +335,7 @@ instance Ord SimulaView where
 makeLenses ''GodotSimulaViewSprite
 makeLenses ''CanvasBase
 makeLenses ''CanvasSurface
+makeLenses ''CanvasAR
 makeLenses ''SimulaView
 makeLenses ''GodotSimulaServer
 makeLenses ''GodotPancakeCamera
@@ -308,6 +343,7 @@ makeLenses ''KeyboardShortcut
 makeLenses ''KeyboardRemapping
 makeLenses ''StartingApps
 makeLenses ''Configuration
+makeLenses ''HUD
 
 -- Godot helper functions (should eventually be exported to godot-extra).
 
@@ -516,9 +552,10 @@ getSingleton constr name = do
   engine <- getEngine
   name' <- toLowLevel name
   b <- G.has_singleton engine name'
-  if b
-    then G.get_singleton engine name' >>= asClass' constr name
-    else error $ "No singleton named " ++ (Data.Text.unpack name)
+  res <- if b then G.get_singleton engine name' >>= asClass' constr name
+              else error $ "No singleton named " ++ (Data.Text.unpack name)
+  Api.godot_string_destroy name'
+  return res
 
 isClass :: GodotObject :< a => a -> Text -> IO Bool
 isClass obj clsName = do
@@ -770,7 +807,8 @@ savePng cs surfaceTexture wlrSurface = do
 
   -- Get file path
   frame <- readTVarIO (gsvs ^. gsvsFrameCount)
-  let pathStr = "./png/" ++ (show (coerce wlrSurface :: Ptr GodotWlrSurface)) ++ "." ++ (show frame) ++ ".png"
+  createDirectoryIfMissing False "media"
+  let pathStr = "./media/" ++ (show (coerce wlrSurface :: Ptr GodotWlrSurface)) ++ "." ++ (show frame) ++ ".png"
   canonicalPath <- canonicalizePath pathStr
   pathStr' <- toLowLevel (pack pathStr)
 
@@ -791,7 +829,8 @@ savePngPancake gss screenshotBaseName = do
   viewportTexture <- G.get_texture viewport
   pancakeImg <- G.get_data viewportTexture
   G.flip_y pancakeImg
-  let relativePath = ("./png/" <> screenshotBaseName <> ".png")
+  createDirectoryIfMissing False "media"
+  let relativePath = ("./media/" <> screenshotBaseName <> ".png")
   fullPath <- System.Directory.canonicalizePath relativePath
   G.save_png pancakeImg =<< toLowLevel (pack relativePath)
   return fullPath
@@ -974,6 +1013,17 @@ orientSpriteTowardsGaze gsvs = do
                atomically $ writeTVar (gsvs ^. gsvsIsDamaged) True -- Useful debugging hack to force gsvs to redraw
                -- G.rotate_object_local gsvs rotationAxisY 3.14159  -- The positive z-axis of the gsvs looks at HMD
 
+
+addLeapMotionScene :: GodotSimulaServer -> IO ()
+addLeapMotionScene gss = do
+  resourceLoader <- getSingleton Godot_ResourceLoader "ResourceLoader"
+  nextScenePath <- toLowLevel (pack "res://addons/gdleapmotion/scenes/leap_motion.tscn")
+  typeHint <- toLowLevel ""
+  (GodotResource nextSceneObj) <- G.load resourceLoader nextScenePath typeHint False
+  let nextScenePacked = GodotPackedScene nextSceneObj
+  nextSceneInstance <- G.instance' nextScenePacked 0
+  addChild gss nextSceneInstance
+
 resizeGSVS :: GodotSimulaViewSprite -> ResizeMethod -> Float -> IO ()
 resizeGSVS gsvs resizeMethod factor =
   do maybeOldTargetDims <- readTVarIO (gsvs ^. gsvsTargetSize)
@@ -1045,7 +1095,8 @@ saveViewportAsPngAndLaunch gsvs tex m22@(V2 (V2 ox oy) (V2 ex ey)) = do
 
                 -- Get file path
                 timeStampStr <- show <$> getCurrentTime
-                let pathStr = "./png/" ++  ((Data.List.filter (/= '"') . show) timeStampStr) ++ ".png"
+                createDirectoryIfMissing False "media"
+                let pathStr = "./media/" ++  ((Data.List.filter (/= '"') . show) timeStampStr) ++ ".png"
                 pathStr' <- toLowLevel (pack pathStr)
 
                 -- Save as png
@@ -1237,7 +1288,7 @@ getParentPid pid = do
     Right xs ->
       case Data.List.lines xs of
         [ws] -> case Data.List.words ws of
-          (_:_:_:ppid:_) -> return . Just . read $ ppid
+          (_:_:_:ppid:_) -> return . Just . Prelude.read $ ppid
     _ -> return Nothing
 
 getParentsPids :: ProcessID  -> IO [ProcessID]
@@ -1311,9 +1362,12 @@ keyboardGrabLetGo gss (GrabWindow gsvs _)  = do
   gss <- readTVarIO $ (gsvs ^. gsvsServer)
   atomically $ writeTVar (gss ^. gssGrab) Nothing
 keyboardGrabLetGo gss (GrabWindows _) = do
-  currentWorkspace <- readTVarIO (gss ^. gssWorkspace)
+  (currentWorkspace, currentWorkspaceStr) <- readTVarIO (gss ^. gssWorkspace)
+  workspacePersistent <- readTVarIO (gss ^. gssWorkspacePersistent)
   currentWorkspaceTransform <- G.get_transform currentWorkspace
+  workspacePersistentTransform <- G.get_transform workspacePersistent
   updateDiffMap gss currentWorkspace currentWorkspaceTransform
+  updateDiffMap gss workspacePersistent workspacePersistentTransform
   atomically $ writeTVar (gss ^. gssGrab) Nothing
 
 keyboardGrabLetGo gss (GrabWorkspaces _) = do
@@ -1399,7 +1453,7 @@ rotateWorkspaceHorizontally gss radians rotationMethod = do
   -- get state
   prevPovTransform <- getARVRCameraOrPancakeCameraTransform gss
   povTransform <- getARVRCameraOrPancakeCameraTransform gss
-  currentWorkspace <- readTVarIO (gss ^. gssWorkspace)
+  (currentWorkspace, currentWorkspaceStr) <- readTVarIO (gss ^. gssWorkspace)
   currentWorkspaceTransform <- G.get_transform currentWorkspace
 
   -- compute new transform
@@ -1525,3 +1579,79 @@ actionRelease gss str = do
   godotStr <- toLowLevel (pack str)
   G.action_release input godotStr
   Api.godot_string_destroy godotStr
+
+logMemPid :: GodotSimulaServer -> IO Float
+logMemPid gss = do
+  let pid = (gss ^. gssPid)
+  (_, out', _) <- System.Process.readCreateProcessWithExitCode (shell $ "ps -p " ++ pid ++ " -o rss=") ""
+  let pidMem = Prelude.read $ out' :: Float
+  -- logStr $ "PID mem: " ++ (show pidMem)
+  -- Control.Concurrent.threadDelay (1 * 1000000)
+  -- logMemPid gss
+  return (pidMem / 1000) -- return ~MB
+
+forkUpdateHUDRecursively :: GodotSimulaServer -> IO ()
+forkUpdateHUDRecursively gss = do
+  configuration <- readTVarIO (gss ^. gssConfiguration)
+  let configPath = (configuration ^. hudConfig)
+  res@(inp,out,err,pid) <- System.IO.Streams.Process.runInteractiveProcess "./result/bin/i3status" ["-c", configPath] Nothing Nothing --
+
+  forkIO $ updateHUDRecursively gss res
+  return ()
+  where updateHUDRecursively :: GodotSimulaServer -> (OutputStream B.ByteString, InputStream B.ByteString, InputStream B.ByteString, ProcessHandle) -> IO ()
+        updateHUDRecursively gss res@(inp,out,err,pid) = do
+          -- let sec = 5
+          -- threadDelay (1000 * 1000 * (sec))
+          updateWorkspaceHUD gss
+          updatei3StatusHUD gss res
+
+          updateHUDRecursively gss res
+
+updateWorkspaceHUD :: GodotSimulaServer -> IO ()
+updateWorkspaceHUD gss = do
+  (currentWorkspace, currentWorkspaceStr) <- readTVarIO (gss ^. gssWorkspace)
+  hud <- readTVarIO (gss ^. gssHUD)
+  let canvasLayer = (hud ^. hudCanvasLayer)
+  let rtLabelW = (hud ^. hudRtlWorkspace)
+  let svr = (hud ^. hudSvrTexture)
+  let dynamicFont = (hud ^. hudDynamicFont)
+  fps <- getSingleton Godot_Engine "Engine" >>= (\engine -> G.get_frames_per_second engine)
+  simulaMemoryUsage <- logMemPid gss
+  screenRecorder <- readTVarIO (gss ^. gssScreenRecorder)
+
+  G.clear rtLabelW
+  G.push_font rtLabelW (safeCast dynamicFont)
+  G.append_bbcode rtLabelW `withGodotString` (pack currentWorkspaceStr)
+  G.append_bbcode rtLabelW `withGodotString` " | "
+  G.add_image rtLabelW svr 19 19
+  G.append_bbcode rtLabelW `withGodotString` " "
+  G.append_bbcode rtLabelW `withGodotString` (pack $ (show $ round fps) ++ " FPS ")
+  G.append_bbcode rtLabelW `withGodotString` (pack ("@ " ++ (show $ round simulaMemoryUsage) ++ " MB"))
+  G.append_bbcode rtLabelW `withGodotString` " |"
+  case screenRecorder of
+    Nothing -> return ()
+    Just ph -> do
+      redColor <- (toLowLevel $ (rgb 1.0 0.0 0.0) `withOpacity` 1.0) :: IO GodotColor
+      G.push_color rtLabelW redColor
+      G.append_bbcode rtLabelW `withGodotString` " ⚬ "
+      G.pop rtLabelW
+      return ()
+  G.pop rtLabelW
+
+updatei3StatusHUD :: GodotSimulaServer -> (OutputStream B.ByteString, InputStream B.ByteString, InputStream B.ByteString, ProcessHandle) -> IO ()
+updatei3StatusHUD gss res@(inp,out,err,pid) = do
+  hud <- readTVarIO (gss ^. gssHUD)
+  out' <- System.IO.Streams.Text.decodeUtf8 out
+  maybeLine <- System.IO.Streams.Internal.read out' :: IO (Maybe Text)
+  let line = Data.Maybe.fromJust maybeLine
+  let line' = unpack line
+  let hudNew = hud { _hudI3Status = line' }
+  atomically $ writeTVar (gss ^. gssHUD) hudNew
+  return ()
+
+withGodotString :: (GodotString -> IO a) -> Text -> IO a
+withGodotString action text = do
+  godotStr <- toLowLevel text
+  ret <- action godotStr
+  Api.godot_string_destroy godotStr
+  return ret
